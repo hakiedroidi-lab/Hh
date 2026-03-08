@@ -1,1 +1,39 @@
-{}
+{
+ "scripts":[
+  {
+   "name":"ItemTool 2.3",
+   "file":"ItemTool_2.3.lua",
+   "version":"2.3",
+   "desc":"Item tool utility script",
+   "author":"Hakie"
+  },
+  {
+   "name":"Resource Generator",
+   "file":"Resource Generator_0.5.lua",
+   "version":"0.5",
+   "desc":"Generate resources in supported games",
+   "author":"Hakie"
+  },
+  {
+   "name":"SCB Mega Script",
+   "file":"SCB_megascript.lua",
+   "version":"1.0",
+   "desc":"Large SCB multipurpose script",
+   "author":"Hakie"
+  },
+  {
+   "name":"Rebirth Masters",
+   "file":"rebirthmasters.lua",
+   "version":"1.0",
+   "desc":"Rebirth Masters helper script",
+   "author":"Hakie"
+  },
+  {
+   "name":"SCBI Test",
+   "file":"scbi test .lua",
+   "version":"1.0",
+   "desc":"Testing script for SCBI",
+   "author":"Hakie"
+  }
+ ]
+}
