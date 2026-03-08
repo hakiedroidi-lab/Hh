@@ -1,12 +1,16 @@
 --[[
 ╔══════════════════════════════════════════════════════════════╗
 ║           REBIRTH MASTERS - GAMEGUARDIAN SCRIPT             ║
-║                     Version: 3.2.0                           ║
+║                     Version: 3.3.0                           ║
 ║  GG 101.1 COMPATIBLE — No refineNumber sign constants       ║
 ║  Uses value-based narrowing instead                         ║
 ║  DUMP.CS: PlayerMgr fields                                  ║
 ║    Honor/Carat/SoulStone/Stage = ObscuredInt → T_XOR(16)   ║
 ║    Gold = BigInteger (large number)                         ║
+║  v3.3: Offset Engine — addresses persist across restarts    ║
+║    • Saves libil2cpp.so-relative offsets                    ║
+║    • Auto-rebuilds on ASLR slide at next launch             ║
+║    • Pointer chain scanner for stable multi-session finds   ║
 ╚══════════════════════════════════════════════════════════════╝
 ]]
 
@@ -66,7 +70,7 @@ local mmax    = math.max
 -- CONFIG
 -- ═══════════════════════════════════════════════════════════════
 local CFG = {
-    VER           = "3.2.0",
+    VER           = "3.3.0",
     AUTO_INTERVAL = 500,   -- ms between auto-farm ticks
     SAVE_KEY      = "RM_V32_DATA",
     PREFS_KEY     = "RM_V32_PREFS",
@@ -114,28 +118,190 @@ local function safe_flags(f)
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- PERSISTENCE
+-- OFFSET ENGINE
+-- Saves libil2cpp.so-relative offsets so addresses survive
+-- game restarts (ASLR slides the library each launch but the
+-- offset from library base → value stays constant).
 -- ═══════════════════════════════════════════════════════════════
+
+-- Cache the library base; resolved once per script run.
+local LIB_BASE = nil
+
+--- Read /proc/self/maps and find the base address of libil2cpp.so.
+--- Returns the integer base address, or nil on failure.
+local function get_lib_base()
+    if LIB_BASE then return LIB_BASE end
+
+    -- gg.getTargetInfo() gives us the package name / PID
+    -- We read /proc/<pid>/maps to locate il2cpp
+    local pid   = tostring(gg.getTargetInfo and gg.getTargetInfo().pid or "self")
+    local paths = {
+        "/proc/" .. pid .. "/maps",
+        "/proc/self/maps",
+    }
+
+    for _, path in ipairs(paths) do
+        local f = io.open(path, "r")
+        if f then
+            for line in f:lines() do
+                -- Lines look like: b400007000-b4c0000000 r--p ... libil2cpp.so
+                if line:find("libil2cpp%.so") then
+                    local base_hex = line:match("^(%x+)%-")
+                    if base_hex then
+                        LIB_BASE = tonumber(base_hex, 16)
+                        f:close()
+                        return LIB_BASE
+                    end
+                end
+            end
+            f:close()
+        end
+    end
+
+    -- Fallback: use gg.getRangesList if maps not readable
+    local ok, ranges = pcall(gg.getRangesList, "libil2cpp.so")
+    if ok and ranges and #ranges > 0 then
+        LIB_BASE = ranges[1].start
+        return LIB_BASE
+    end
+
+    return nil
+end
+
+--- Convert an absolute address → (base, offset) pair.
+--- Returns offset as integer, or nil if base unavailable.
+local function addr_to_offset(abs_addr)
+    local base = get_lib_base()
+    if not base then return nil end
+    local off = abs_addr - base
+    -- Sanity: offset should be positive and < 256 MB
+    if off < 0 or off > 0x10000000 then return nil end
+    return off
+end
+
+--- Rebuild an absolute address from a stored offset.
+local function offset_to_addr(offset)
+    local base = get_lib_base()
+    if not base then return nil end
+    return base + offset
+end
+
+--- Quick sanity-check: try to read 4 bytes at addr.
+--- Returns true if the memory read succeeds.
+local function addr_valid(abs_addr)
+    local ok, res = pcall(gg.getValues, {
+        { address = abs_addr, flags = T_DWORD }
+    })
+    return ok and res and #res > 0 and (res[1].value ~= nil)
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- POINTER SCANNER
+-- Walk a chain of pointers to locate a stable PlayerMgr field.
+-- Usage:
+--   pointer_scan(base_addr, { offset1, offset2, ... })
+-- Returns final resolved address or nil.
+-- ─────────────────────────────────────────────────────────────
+local function pointer_scan(base_addr, chain)
+    local addr = base_addr
+    for i, off in ipairs(chain) do
+        local ok, res = pcall(gg.getValues, {
+            { address = addr, flags = T_QWORD }   -- 64-bit pointer
+        })
+        if not ok or not res or #res == 0 then return nil end
+        local ptr = res[1].value
+        if not ptr or ptr == 0 then return nil end
+        addr = ptr + off
+    end
+    return addr
+end
+
+--- Attempt to walk a known pointer chain for a PlayerMgr field.
+--- Chains should be discovered once (via manual GG pointer scan)
+--- and stored here as CFG entries.
+local function resolve_ptr_chain(chain_def)
+    if not chain_def then return nil end
+    local base = get_lib_base()
+    if not base then return nil end
+    -- chain_def = { static_offset, { ptr_offsets... } }
+    local static_addr = base + chain_def.static_offset
+    local final_addr  = pointer_scan(static_addr, chain_def.chain)
+    if final_addr and addr_valid(final_addr) then
+        return final_addr
+    end
+    return nil
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- PERSISTENCE  (offset-relative, restarts-safe)
+-- ═══════════════════════════════════════════════════════════════
+
+--- Build a serialisable addr-record that stores both the raw
+--- address AND the il2cpp offset so the next session can
+--- rebuild the address without re-scanning.
+local function make_addr_record(abs_addr, ftype)
+    local off = addr_to_offset(abs_addr)
+    return {
+        address    = abs_addr,        -- runtime address (this session)
+        il2cpp_off = off,             -- offset from libil2cpp.so base
+        ftype      = ftype or T_XOR,
+    }
+end
+
+--- Given a stored record (may be from a previous session),
+--- return a valid runtime address or nil.
+local function resolve_addr_record(rec)
+    if not rec then return nil end
+    -- 1. Try direct address first (same session / same ASLR slide)
+    if rec.address and addr_valid(rec.address) then
+        return rec.address
+    end
+    -- 2. Rebuild from il2cpp offset
+    if rec.il2cpp_off then
+        local rebuilt = offset_to_addr(rec.il2cpp_off)
+        if rebuilt and addr_valid(rebuilt) then
+            return rebuilt
+        end
+    end
+    return nil
+end
+
 local function save()
-    local d = {}
+    local base = get_lib_base()
+    local d    = {}
+
     -- Gold
     if #GOLD.addrs > 0 then
         local a = {}
         for _, v in ipairs(GOLD.addrs) do
-            tinsert(a, { address = v.address, ftype = v.ftype or T_XOR })
+            local off = v.il2cpp_off or addr_to_offset(v.address)
+            tinsert(a, {
+                address    = v.address,
+                il2cpp_off = off,
+                ftype      = v.ftype or T_XOR,
+            })
         end
         d.gold = { addrs = a, last = GOLD.last }
     end
+
     -- Currencies
     for k, c in pairs(CURR) do
         if #c.addrs > 0 then
             local a = {}
             for _, v in ipairs(c.addrs) do
-                tinsert(a, { address = v.address, ftype = v.ftype or T_XOR })
+                local off = v.il2cpp_off or addr_to_offset(v.address)
+                tinsert(a, {
+                    address    = v.address,
+                    il2cpp_off = off,
+                    ftype      = v.ftype or T_XOR,
+                })
             end
             d[k] = { addrs = a, last = c.last }
         end
     end
+
+    -- Also persist the lib base so we can detect ASLR changes on load
+    d.__lib_base = base
 
     local ok, s = pcall(gg.toJson, d)
     if ok then gg.setVariable(CFG.SAVE_KEY, s) end
@@ -144,35 +310,94 @@ local function save()
     if ok2 then gg.setVariable(CFG.PREFS_KEY, s2) end
 
     local n = #GOLD.addrs
+    local lib_str = base and sformat(" | lib=0x%x", base) or ""
     for _, c in pairs(CURR) do n = n + #c.addrs end
-    T("💾 Saved " .. n .. " addresses")
+    T("💾 Saved " .. n .. " addresses" .. lib_str)
 end
 
 local function load()
     local ss = gg.getVariable(CFG.SAVE_KEY)
     local ps = gg.getVariable(CFG.PREFS_KEY)
     local n  = 0
+    local stale = 0
 
     if ss and ss ~= "" then
         local ok, d = pcall(gg.fromJson, ss)
         if ok and type(d) == "table" then
-            if d.gold and d.gold.addrs then
-                -- Restore ftype, falling back to T_XOR if missing
-                for _, a in ipairs(d.gold.addrs) do
-                    if not a.ftype or a.ftype == 0 then a.ftype = T_XOR end
-                end
-                GOLD.addrs = d.gold.addrs
-                GOLD.last  = d.gold.last or 0
-                n = n + 1
+
+            -- Detect ASLR slide: saved base vs current base
+            local saved_base   = d.__lib_base
+            local current_base = get_lib_base()
+            local slide        = 0
+            if saved_base and current_base and saved_base ~= current_base then
+                slide = current_base - saved_base
+                T(sformat("📐 ASLR slide detected: 0x%x → rebuilding addresses", slide))
             end
-            for k, info in pairs(d) do
-                if k ~= "gold" and CURR[k] and info.addrs then
-                    for _, a in ipairs(info.addrs) do
-                        if not a.ftype or a.ftype == 0 then a.ftype = T_XOR end
+
+            -- Helper: restore one address list
+            local function restore_addrs(raw_list, fallback_ftype)
+                local out   = {}
+                for _, a in ipairs(raw_list) do
+                    local ftype = a.ftype or fallback_ftype or T_XOR
+                    if not ftype or ftype == 0 then ftype = T_XOR end
+
+                    -- Priority 1: use stored il2cpp offset (most reliable)
+                    if a.il2cpp_off and current_base then
+                        local rebuilt = current_base + a.il2cpp_off
+                        tinsert(out, {
+                            address    = rebuilt,
+                            il2cpp_off = a.il2cpp_off,
+                            ftype      = ftype,
+                        })
+
+                    -- Priority 2: slide the raw address
+                    elseif a.address and slide ~= 0 then
+                        local slid = a.address + slide
+                        tinsert(out, {
+                            address    = slid,
+                            il2cpp_off = a.il2cpp_off,
+                            ftype      = ftype,
+                        })
+
+                    -- Priority 3: use raw address as-is (same session or no lib found)
+                    elseif a.address then
+                        tinsert(out, {
+                            address    = a.address,
+                            il2cpp_off = a.il2cpp_off,
+                            ftype      = ftype,
+                        })
                     end
-                    CURR[k].addrs = info.addrs
-                    CURR[k].last  = info.last or 0
+                end
+                return out
+            end
+
+            -- Validate restored addresses (sample first addr of each group)
+            local function validate_group(addrs)
+                if #addrs == 0 then return false end
+                return addr_valid(addrs[1].address)
+            end
+
+            if d.gold and d.gold.addrs then
+                local restored = restore_addrs(d.gold.addrs, T_XOR)
+                if validate_group(restored) then
+                    GOLD.addrs = restored
+                    GOLD.last  = d.gold.last or 0
                     n = n + 1
+                else
+                    stale = stale + 1
+                end
+            end
+
+            for k, info in pairs(d) do
+                if k ~= "gold" and k ~= "__lib_base" and CURR[k] and info.addrs then
+                    local restored = restore_addrs(info.addrs, T_XOR)
+                    if validate_group(restored) then
+                        CURR[k].addrs = restored
+                        CURR[k].last  = info.last or 0
+                        n = n + 1
+                    else
+                        stale = stale + 1
+                    end
                 end
             end
         end
@@ -185,7 +410,12 @@ local function load()
         end
     end
 
-    if n > 0 then T("📂 Loaded " .. n .. " currencies") end
+    if n > 0 then
+        T("📂 Loaded " .. n .. " currencies ✅")
+    end
+    if stale > 0 then
+        T("⚠️ " .. stale .. " groups had stale addrs → re-find needed")
+    end
     return n > 0
 end
 
@@ -195,6 +425,7 @@ local function clear_data()
     GOLD.addrs = {}; GOLD.last = 0
     for _, c in pairs(CURR) do c.addrs = {}; c.last = 0 end
     S.last_values = {}
+    LIB_BASE = nil  -- force re-resolve on next use
     T("🗑️ Cleared all data")
 end
 
@@ -209,6 +440,152 @@ local function auto_save()
         end
         if has then save(); S.last_save = now end
     end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- POINTER CHAIN MENU  (manual registration + test)
+-- ─────────────────────────────────────────────────────────────
+-- Chains are stored as CFG.PTR_CHAINS = { gold={...}, honor={...} }
+-- Each chain: { static_offset=0x1234abc, chain={0x10, 0x48, 0xC} }
+-- These offsets come from a GG pointer scan (do once per game version).
+-- ─────────────────────────────────────────────────────────────
+CFG.PTR_CHAINS = CFG.PTR_CHAINS or {}
+
+local function ptr_chain_status()
+    local n = 0
+    for _ in pairs(CFG.PTR_CHAINS) do n = n + 1 end
+    return n
+end
+
+local function ptr_chains_menu()
+    local base = get_lib_base()
+    local base_str = base and sformat("0x%x", base) or "NOT FOUND"
+
+    local m = gg.alert(
+        "POINTER CHAIN MANAGER\n\n" ..
+        "libil2cpp.so base: " .. base_str .. "\n" ..
+        "Registered chains: " .. ptr_chain_status() .. "\n\n" ..
+        "How to use:\n" ..
+        "1. In GG, do a pointer scan to find a stable\n" ..
+        "   pointer to e.g. PlayerMgr.gold\n" ..
+        "2. Note the static offset (from libil2cpp.so base)\n" ..
+        "   and the pointer chain offsets\n" ..
+        "3. Press 'Register Chain' below\n" ..
+        "4. On next load the script rebuilds addresses\n" ..
+        "   automatically via the chain — no re-scan needed!\n\n" ..
+        "Tip: Chains survive game updates IF the static\n" ..
+        "offset (il2cpp symbol) hasn't changed.",
+        "Register Chain", "Test Chains", "Close"
+    )
+
+    if m == 1 then
+        -- Register a new pointer chain interactively
+        local inp = gg.prompt(
+            {
+                "Currency key (gold/honor/carat/soulstone/stage):",
+                "Static offset from libil2cpp base (hex, e.g. 1A3F200):",
+                "Pointer chain offsets (comma-sep hex, e.g. 10,48,C):",
+            },
+            { "gold", "", "" },
+            { "text", "text", "text" }
+        )
+        if inp and inp[1] and inp[2] and inp[3] then
+            local key      = inp[1]:lower():gsub("%s", "")
+            local st_off   = tonumber("0x" .. inp[2]:gsub("0x",""), 16) or tonumber(inp[2])
+            local chain_t  = {}
+            for hex in inp[3]:gmatch("[%x]+") do
+                tinsert(chain_t, tonumber("0x"..hex, 16) or 0)
+            end
+
+            if st_off and #chain_t > 0 then
+                CFG.PTR_CHAINS[key] = { static_offset = st_off, chain = chain_t }
+                -- Immediately try to resolve
+                local addr = resolve_ptr_chain(CFG.PTR_CHAINS[key])
+                if addr then
+                    T("✅ Chain for '" .. key .. "' resolved → 0x" .. sformat("%x", addr))
+                    -- Inject into the right address list
+                    local rec = make_addr_record(addr, T_XOR)
+                    if key == "gold" then
+                        GOLD.addrs = { rec }
+                    elseif CURR[key] then
+                        CURR[key].addrs = { rec }
+                    end
+                    save()
+                else
+                    T("⚠️ Chain registered but could not resolve yet. Try when in-game.")
+                end
+            else
+                T("❌ Invalid input — chain not saved")
+            end
+        end
+
+    elseif m == 2 then
+        -- Test all registered chains
+        if ptr_chain_status() == 0 then
+            T("No chains registered yet.")
+            return
+        end
+        local results = "CHAIN TEST RESULTS:\n"
+        for key, chain_def in pairs(CFG.PTR_CHAINS) do
+            local addr = resolve_ptr_chain(chain_def)
+            if addr then
+                results = results .. "✅ " .. key .. " → 0x" .. sformat("%x", addr) .. "\n"
+                -- Update the live address
+                local rec = make_addr_record(addr, T_XOR)
+                if key == "gold" then
+                    GOLD.addrs = { rec }
+                elseif CURR[key] then
+                    CURR[key].addrs = { rec }
+                end
+            else
+                results = results .. "❌ " .. key .. " → failed\n"
+            end
+        end
+        gg.alert(results)
+        save()
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- OFFSET INFO DISPLAY
+-- ═══════════════════════════════════════════════════════════════
+local function show_offset_info()
+    local base = get_lib_base()
+    local lines = { sformat("OFFSET INFO — v%s", CFG.VER), "" }
+
+    if base then
+        tinsert(lines, sformat("libil2cpp.so base: 0x%x", base))
+    else
+        tinsert(lines, "⚠️ libil2cpp.so NOT FOUND")
+        tinsert(lines, "  (Must be launched from in-game)")
+    end
+    tinsert(lines, "")
+
+    -- Gold
+    local function addr_info(label, addrs)
+        if #addrs == 0 then
+            tinsert(lines, label .. ": (not found)")
+            return
+        end
+        local v = addrs[1]
+        local off_str = v.il2cpp_off
+            and sformat("0x%x", v.il2cpp_off)
+            or  (base and sformat("0x%x", v.address - base) or "?")
+        tinsert(lines, sformat("%s: addr=0x%x  off=%s", label, v.address, off_str))
+    end
+
+    addr_info("Gold",      GOLD.addrs)
+    addr_info("Honor",     CURR.honor.addrs)
+    addr_info("Carat",     CURR.carat.addrs)
+    addr_info("SoulStone", CURR.soulstone.addrs)
+    addr_info("Stage",     CURR.stage.addrs)
+    addr_info("HighStage", CURR.highstage.addrs)
+    addr_info("TeamLevel", CURR.teamlevel.addrs)
+
+    tinsert(lines, "")
+    tinsert(lines, "Pointer chains: " .. ptr_chain_status())
+
+    gg.alert(table.concat(lines, "\n"))
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -229,15 +606,16 @@ local function make_edits(addrs, value, ftype, limit)
     return edits
 end
 
--- Search for an exact value, return found addr list
+-- Search for an exact value, return found addr list (with il2cpp offsets)
 local function search_exact(val, ftype)
     CLR()
     gg.setRanges(R_ALL)
     gg.searchNumber(tostring(val), ftype)
-    local res  = gg.getResults(200)
+    local res   = gg.getResults(200)
     local found = {}
     for _, v in ipairs(res) do
-        tinsert(found, { address = v.address, ftype = ftype })
+        -- Store il2cpp offset immediately so save() works even same session
+        tinsert(found, make_addr_record(v.address, ftype))
     end
     CLR()
     return found, res
@@ -334,7 +712,7 @@ local function auto_find_obscured(key)
 
     local found = {}
     for _, v in ipairs(res) do
-        tinsert(found, { address = v.address, ftype = T_XOR })
+        tinsert(found, make_addr_record(v.address, T_XOR))
     end
 
     c.addrs = found
@@ -475,7 +853,7 @@ local function auto_find_gold()
 
     local found = {}
     for _, v in ipairs(res) do
-        tinsert(found, { address = v.address, ftype = T_XOR })
+        tinsert(found, make_addr_record(v.address, T_XOR))
     end
     GOLD.addrs = found
     GOLD.last  = res[1] and res[1].value or 0
@@ -596,9 +974,11 @@ local function draw_full()
             "📂 Load Addresses",
             "🗑️ Clear All Saved Data",
             "📊 Status",
+            "📐 Offset Info",
+            "🔗 Pointer Chains",
             "❓ Help",
         }
-        n_items = 6
+        n_items = 8
     end
 
     tinsert(opts, "⬅️ Prev Tab")
@@ -683,6 +1063,10 @@ local function handle_full(choice, n_items)
                 #CURR.highstage.addrs, #CURR.teamlevel.addrs
             ))
         elseif choice == 6 then
+            show_offset_info()
+        elseif choice == 7 then
+            ptr_chains_menu()
+        elseif choice == 8 then
             gg.alert([[REBIRTH MASTERS v3.2 — GG 101.1 COMPATIBLE
 
 MEMORY TYPES (from dump.cs analysis):
